@@ -12,17 +12,34 @@ load_dotenv()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 XAI_API_KEY = os.getenv("XAI_API_KEY")
 GROK_API_URL = os.getenv("GROK_API_URL", "https://api.x.ai/v1/chat/completions")
-MCP_SERVER_URL = os.getenv("MCP_SERVER_URL", "http://127.0.0.1:8000/get_crypto_news")
+# MCP server registry for conversion layer
+MCP_SERVERS = {
+    "cryptopanic": os.getenv("MCP_SERVER_URL", "http://127.0.0.1:8000/get_crypto_news"),
+    # Add more MCP server mappings here if needed
+}
+
+class TelegramFilter(logging.Filter):
+    def filter(self, record):
+        msg = record.getMessage()
+        # Skip Telegram POST requests
+        if (
+            msg.startswith("HTTP Request: POST https://api.telegram.org/") and
+            any(endpoint in msg for endpoint in ["sendMessage", "getUpdates", "getMe", "deleteWebhook"])
+        ):
+            return False
+        return True
 
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s %(levelname)s %(message)s',
+    format='[%(levelname)s] %(asctime)s | %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S',
     handlers=[
         logging.FileHandler("bot.log"),
         logging.StreamHandler()
     ]
 )
 logger = logging.getLogger(__name__)
+logger.addFilter(TelegramFilter())
 
 def extract_coins_from_query(query: str):
     """Extract possible coin symbols or names from the user query (very basic)."""
@@ -31,19 +48,43 @@ def extract_coins_from_query(query: str):
     found = [c for c in coins if c in query.lower()]
     return found if found else None
 
-def fetch_crypto_news(user_query: str, kind: str = "news", num_pages: int = 1) -> str:
-    """Fetch crypto news from MCP server (GET), optionally filtered by kind and num_pages."""
-    params = {"kind": kind, "num_pages": num_pages}
+def call_mcp_server(mcp_choice: str, params: dict) -> str:
+    """Call the specified MCP server with given params."""
+    url = MCP_SERVERS.get(mcp_choice)
+    if not url:
+        logger.error(f"Unknown MCP server: {mcp_choice}")
+        return None
     try:
-        resp = requests.get(MCP_SERVER_URL, params=params, timeout=15)
+        resp = requests.get(url, params=params, timeout=15)
         resp.raise_for_status()
         news = resp.text.strip()
         if not news or news.lower().startswith("no news"):
             return None
         return news
     except Exception as e:
-        logger.error(f"Error fetching news: {e}")
+        logger.error(f"Error fetching from {mcp_choice}: {e}")
         return None
+
+import json
+
+def get_mcp_selection_from_llm(user_query: str) -> dict:
+    """Prompt xAI/Grok to select the MCP server and arguments for the user's query."""
+    prompt = (
+        "Given the following user query, decide which MCP server to use and what arguments to pass. "
+        "Respond ONLY with a JSON object with keys 'mcp_server' and 'params'. "
+        "Example: {\"mcp_server\": \"cryptopanic\", \"params\": {\"kind\": \"news\", \"filter\": \"hot\", \"currencies\": \"BTC,ETH\", \"regions\": \"en,es\", \"public\": true, \"num_pages\": 2}}.\n"
+        f"User query: {user_query}"
+    )
+    response = summarize_with_grok(prompt)
+    try:
+        data = json.loads(response)
+        if not ("mcp_server" in data and "params" in data):
+            raise ValueError("Missing required keys in LLM response")
+        return data
+    except Exception as e:
+        logger.error(f"Failed to parse LLM MCP response: {e} | Raw response: {response}")
+        # Fallback to default
+        return {"mcp_server": "cryptopanic", "params": {"kind": "news", "num_pages": 1}}
 
 import time
 
@@ -62,10 +103,13 @@ def summarize_with_grok(prompt: str) -> str:
     max_retries = 3
     for attempt in range(1, max_retries + 1):
         try:
+            logger.info(f"[XAI] Requesting Grok (attempt {attempt}): {payload}")
             resp = requests.post(GROK_API_URL, headers=headers, json=payload, timeout=15)
             resp.raise_for_status()
             data = resp.json()
-            return data.get("choices", [{}])[0].get("message", {}).get("content", "")
+            summary = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+            logger.info(f"[XAI] Grok response: {summary}")
+            return summary
         except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
             logger.warning(f"xAI API timeout/connection error (attempt {attempt}/{max_retries}): {e}")
             if attempt < max_retries:
@@ -82,21 +126,29 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_message = update.message.text
+    logger.info(f"[USER] Message: {user_message}")
     try:
-        # Heuristic: If user asks for news, fetch from MCP, else just use xAI
-        if any(word in user_message.lower() for word in ["news", "latest", "update", "headline", "price", "market"]):
-            news = fetch_crypto_news(user_message)
-            if not news:
-                await update.message.reply_text("Sorry, I couldn't fetch news at the moment. Please try again later.")
-                return
-            coins = extract_coins_from_query(user_message)
-            if coins:
-                prompt = f"User asked: {user_message}\nHere are the latest crypto news headlines for {', '.join(coins)}:\n{news}\nSummarize or answer the user's question using this news."
-            else:
-                prompt = f"User asked: {user_message}\nHere are the latest crypto news headlines:\n{news}\nSummarize or answer the user's question using this news."
-        else:
-            prompt = user_message
+        # Ask LLM which MCP server and arguments to use for this query
+        llm_decision = get_mcp_selection_from_llm(user_message)
+        logger.info(f"[LLM] Decision: {llm_decision}")
+        mcp_server = llm_decision.get("mcp_server", "cryptopanic")
+        params = llm_decision.get("params", {"kind": "news", "num_pages": 1})
+        logger.info(f"[MCP] Requesting {mcp_server} with params: {params}")
+        news = call_mcp_server(mcp_server, params)
+        if not news:
+            logger.warning(f"[MCP] No news returned for {mcp_server} with params: {params}")
+            await update.message.reply_text("Sorry, I couldn't fetch news at the moment. Please try again later.")
+            return
+        # Optionally, include MCP server info in the prompt to xAI
+        prompt = (
+            f"User asked: {user_message}\n"
+            f"MCP server used: {mcp_server}\n"
+            f"Parameters: {params}\n"
+            f"Here are the latest crypto news headlines:\n{news}\nSummarize or answer the user's question using this news."
+        )
+        logger.info(f"[XAI] Prompt to Grok: {prompt}")
         summary = summarize_with_grok(prompt)
+        logger.info(f"[BOT] Reply: {summary}")
         if not summary or summary.startswith("[Error summarizing"):
             await update.message.reply_text("Sorry, I couldn't get an answer from xAI at the moment.")
         else:
